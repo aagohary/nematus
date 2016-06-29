@@ -170,13 +170,6 @@ def concatenate(tensor_list, axis=0):
 
     return out
 
-# return name of word embedding for factor i
-# special handling of factor 0 for backward compatibility
-def embedding_name(i):
-    if i == 0:
-        return 'Wemb'
-    else:
-        return 'Wemb'+str(i)
 
 # batch preparation
 def prepare_data(seqs_x, seqs_y, maxlen=None, n_words_src=30000,
@@ -205,16 +198,15 @@ def prepare_data(seqs_x, seqs_y, maxlen=None, n_words_src=30000,
             return None, None, None, None
 
     n_samples = len(seqs_x)
-    n_factors = len(seqs_x[0][0])
     maxlen_x = numpy.max(lengths_x) + 1
     maxlen_y = numpy.max(lengths_y) + 1
 
-    x = numpy.zeros((n_factors, maxlen_x, n_samples)).astype('int64')
+    x = numpy.zeros((maxlen_x, n_samples)).astype('int64')
     y = numpy.zeros((maxlen_y, n_samples)).astype('int64')
     x_mask = numpy.zeros((maxlen_x, n_samples)).astype('float32')
     y_mask = numpy.zeros((maxlen_y, n_samples)).astype('float32')
     for idx, [s_x, s_y] in enumerate(zip(seqs_x, seqs_y)):
-        x[:, :lengths_x[idx], idx] = zip(*s_x)
+        x[:lengths_x[idx], idx] = s_x
         x_mask[:lengths_x[idx]+1, idx] = 1.
         y[:lengths_y[idx], idx] = s_y
         y_mask[:lengths_y[idx]+1, idx] = 1.
@@ -548,9 +540,7 @@ def init_params(options):
     params = OrderedDict()
 
     # embedding
-    for factor in range(options['factors']):
-        params[embedding_name(factor)] = norm_weight(options['n_words_src'], options['dim_per_factor'][factor])
-
+    params['Wemb'] = norm_weight(options['n_words_src'], options['dim_word'])
     params['Wemb_dec'] = norm_weight(options['n_words'], options['dim_word'])
 
     # encoder: bidirectional RNN
@@ -598,8 +588,8 @@ def build_model(tparams, options):
     use_noise = theano.shared(numpy.float32(0.))
 
     # description string: #words x #samples
-    x = tensor.tensor3('x', dtype='int64')
-    x.tag.test_value = (numpy.random.rand(1, 5, 10)*100).astype('int64')
+    x = tensor.matrix('x', dtype='int64')
+    x.tag.test_value = (numpy.random.rand(5, 10)*100).astype('int64')
     x_mask = tensor.matrix('x_mask', dtype='float32')
     x_mask.tag.test_value = numpy.ones(shape=(5, 10)).astype('float32')
     y = tensor.matrix('y', dtype='int64')
@@ -608,12 +598,12 @@ def build_model(tparams, options):
     y_mask.tag.test_value = numpy.ones(shape=(8, 10)).astype('float32')
 
     # for the backward rnn, we just need to invert x and x_mask
-    xr = x[:,::-1]
+    xr = x[::-1]
     xr_mask = x_mask[::-1]
 
-    n_timesteps = x.shape[1]
+    n_timesteps = x.shape[0]
     n_timesteps_trg = y.shape[0]
-    n_samples = x.shape[2]
+    n_samples = x.shape[1]
 
     if options['use_dropout']:
         retain_probability_emb = 1-options['dropout_embedding']
@@ -641,10 +631,7 @@ def build_model(tparams, options):
         ctx_dropout_d = theano.shared(numpy.array([1.]*4, dtype='float32'))
 
     # word embedding for forward rnn (source)
-    emb = []
-    for factor in range(options['factors']):
-        emb.append(tparams[embedding_name(factor)][x[factor].flatten()])
-    emb = concatenate(emb, axis=1)
+    emb = tparams['Wemb'][x.flatten()]
     emb = emb.reshape([n_timesteps, n_samples, options['dim_word']])
     if options['use_dropout']:
         emb *= source_dropout
@@ -657,10 +644,7 @@ def build_model(tparams, options):
     
 
     # word embedding for backward rnn (source)
-    embr = []
-    for factor in range(options['factors']):
-        embr.append(tparams[embedding_name(factor)][xr[factor].flatten()])
-    embr = concatenate(embr, axis=1)
+    embr = tparams['Wemb'][xr.flatten()]
     embr = embr.reshape([n_timesteps, n_samples, options['dim_word']])
     if options['use_dropout']:
         embr *= source_dropout[::-1]
@@ -757,20 +741,15 @@ def build_model(tparams, options):
 
 # build a sampler
 def build_sampler(tparams, options, use_noise, trng, return_alignment=False):
-    x = tensor.tensor3('x', dtype='int64')
-    xr = x[:,::-1]
-    n_timesteps = x.shape[1]
-    n_samples = x.shape[2]
+    x = tensor.matrix('x', dtype='int64')
+    xr = x[::-1]
+    n_timesteps = x.shape[0]
+    n_samples = x.shape[1]
 
     # word embedding (source), forward and backward
-    emb = []
-    embr = []
-    for factor in range(options['factors']):
-        emb.append(tparams[embedding_name(factor)][x[factor].flatten()])
-        embr.append(tparams[embedding_name(factor)][xr[factor].flatten()])
-    emb = concatenate(emb, axis=1)
-    embr = concatenate(embr, axis=1)
+    emb = tparams['Wemb'][x.flatten()]
     emb = emb.reshape([n_timesteps, n_samples, options['dim_word']])
+    embr = tparams['Wemb'][xr.flatten()]
     embr = embr.reshape([n_timesteps, n_samples, options['dim_word']])
 
     if options['use_dropout']:
@@ -1060,11 +1039,6 @@ def pred_probs(f_log_probs, prepare_data, options, iterator, verbose=True, norma
     alignments_json = []
 
     for x, y in iterator:
-        #ensure consistency in number of factors
-        if len(x[0][0]) != options['factors']:
-            sys.stderr.write('Error: mismatch between number of factors in settings ({0}), and number in validation corpus ({1})\n'.format(options['factors'], len(x[0][0])))
-            sys.exit(1)
-
         n_done += len(x)
 
         x, x_mask, y, y_mask = prepare_data(x, y,
@@ -1092,6 +1066,9 @@ def pred_probs(f_log_probs, prepare_data, options, iterator, verbose=True, norma
 
         if verbose:
             print >>sys.stderr, '%d samples computed' % (n_done)
+
+        print "predicted probs length = ",len(probs)
+        print probs
 
     return numpy.array(probs), alignments_json
 
@@ -1137,16 +1114,71 @@ def adam(lr, tparams, grads, inp, cost):
     return f_grad_shared, f_update
 
 
+"""Ahmed: restartable
+init_accumulators is a dict of:
+    running_up2_init: dicts of param key and its running update. 
+    running_grads2_init: dicts of param key and its running grad.
+init to zero if None
+"""
+def adadelta(lr, tparams, grads, inp, cost, init_accumulators=None):
+    zipped_grads = [theano.shared(p.get_value() * numpy.float32(0.),
+                                  name='%s_grad' % k)
+                    for k, p in tparams.iteritems()] #always set to zero -- grads are just copied later
+    
+    if init_accumulators is None:
+        running_up2 = [theano.shared(p.get_value() * numpy.float32(0.),
+                                     name='%s_rup2' % k)
+                       for k, p in tparams.iteritems()] 
+
+        running_grads2 = [theano.shared(p.get_value() * numpy.float32(0.),
+                                        name='%s_rgrad2' % k)
+                          for k, p in tparams.iteritems()] 
+
+    else:
+        running_up2 = [theano.shared(init_accumulators['running_up2']['%s_rup2' % k],
+                                name='%s_rup2' % k)
+                            for k in tparams.keys()] 
+
+        running_grads2 = [theano.shared(init_accumulators['running_grads2']['%s_rgrad2' % k],
+                                name='%s_rgrad2' % k)
+                            for k in tparams.keys()] 
+        
+
+    zgup = [(zg, g) for zg, g in zip(zipped_grads, grads)]
+    rg2up = [(rg2, 0.95 * rg2 + 0.05 * (g ** 2))
+             for rg2, g in zip(running_grads2, grads)]
+
+    f_grad_shared = theano.function(inp, cost, updates=zgup+rg2up,
+                                    profile=profile)
+
+    updir = [-tensor.sqrt(ru2 + 1e-6) / tensor.sqrt(rg2 + 1e-6) * zg
+             for zg, ru2, rg2 in zip(zipped_grads, running_up2,
+                                     running_grads2)]
+    ru2up = [(ru2, 0.95 * ru2 + 0.05 * (ud ** 2))
+             for ru2, ud in zip(running_up2, updir)]
+    param_up = [(p, p + ud) for p, ud in zip(itemlist(tparams), updir)]
+
+    f_update = theano.function([lr], [], updates=ru2up+param_up,
+                               on_unused_input='ignore', profile=profile)
+
+    accumulators = {} # dict of lists of shared variables for storage purposes
+    accumulators['running_up2'] = running_up2
+    accumulators['running_grads2'] = running_grads2    
+    return f_grad_shared, f_update, accumulators
+
+
+""" Ahmed: Replaced with a restartable implementation (see above)
 def adadelta(lr, tparams, grads, inp, cost):
     zipped_grads = [theano.shared(p.get_value() * numpy.float32(0.),
                                   name='%s_grad' % k)
                     for k, p in tparams.iteritems()]
     running_up2 = [theano.shared(p.get_value() * numpy.float32(0.),
                                  name='%s_rup2' % k)
-                   for k, p in tparams.iteritems()]
+                   for k, p in tparams.iteritems()] 
+
     running_grads2 = [theano.shared(p.get_value() * numpy.float32(0.),
                                     name='%s_rgrad2' % k)
-                      for k, p in tparams.iteritems()]
+                      for k, p in tparams.iteritems()]  
 
     zgup = [(zg, g) for zg, g in zip(zipped_grads, grads)]
     rg2up = [(rg2, 0.95 * rg2 + 0.05 * (g ** 2))
@@ -1166,7 +1198,7 @@ def adadelta(lr, tparams, grads, inp, cost):
                                on_unused_input='ignore', profile=profile)
 
     return f_grad_shared, f_update
-
+"""
 
 def rmsprop(lr, tparams, grads, inp, cost):
     zipped_grads = [theano.shared(p.get_value() * numpy.float32(0.),
@@ -1215,10 +1247,19 @@ def sgd(lr, tparams, grads, inp, cost):
 
     return f_grad_shared, f_update
 
+#Ahmed
+def get_accumlators_values(accumlators):
+    store = {}
+    for k,v in accumlators.iteritems():
+        d = {}
+        for vi in v:
+            d[vi.name]=vi.get_value()
+        store[k] = d
+    return store
+
+
 def train(dim_word=100,  # word vector dimensionality
           dim=1000,  # the number of LSTM units
-          factors=1, # input factors
-          dim_per_factor=None, # list of word vector dimensionalities (one per factor): [250,200,50] for total dimensionality of 500
           encoder='gru',
           decoder='gru_cond',
           patience=10,  # early stopping patience
@@ -1252,27 +1293,17 @@ def train(dim_word=100,  # word vector dimensionality
           dropout_hidden=0.5, # dropout for hidden layers (0: no dropout)
           dropout_source=0, # dropout source words (0: no dropout)
           dropout_target=0, # dropout target words (0: no dropout)
-          reload_=False,
+          reload_=False,  
+          init_accumulators_path=None,
+          model_reload_path=None,
           overwrite=False,
           external_validation_script=None,
           shuffle_each_epoch=True,
-          finetune=False,
-          maxibatch_size=20): #How many minibatches to load at one time
+          finetune=False):
+
 
     # Model options
     model_options = locals().copy()
-
-
-    if model_options['dim_per_factor'] == None:
-        if factors == 1:
-            model_options['dim_per_factor'] = [model_options['dim_word']]
-        else:
-            sys.stderr.write('Error: if using factored input, you must specify \'dim_per_factor\'\n')
-            sys.exit(1)
-
-    assert(len(dictionaries) == factors + 1) # one dictionary per source factor + 1 for target factor
-    assert(len(model_options['dim_per_factor']) == factors) # each factor embedding has its own dimensionality
-    assert(sum(model_options['dim_per_factor']) == model_options['dim_word']) # dimensionality of factor embeddings sums up to total dimensionality of input embedding vector
 
     # load dictionaries and invert them
     worddicts = [None] * len(dictionaries)
@@ -1293,16 +1324,23 @@ def train(dim_word=100,  # word vector dimensionality
             with open('%s.pkl' % saveto, 'rb') as f:
                 model_options = pkl.load(f)
 
+    # reload accumlators
+    init_accumulators = None
+    if reload_ and init_accumulators_path is not None and os.path.exists(init_accumulators_path):
+        print 'Reloading optimizer accumlators'
+        init_accumulators = pkl.load(open(init_accumulators_path, 'rb'))
+
+
+
     print 'Loading data'
     train = TextIterator(datasets[0], datasets[1],
-                         dictionaries[:-1], dictionaries[-1],
+                         dictionaries[0], dictionaries[1],
                          n_words_source=n_words_src, n_words_target=n_words,
                          batch_size=batch_size,
                          maxlen=maxlen,
-                         shuffle_each_epoch=shuffle_each_epoch,
-                         maxibatch_size=maxibatch_size)
+                         shuffle_each_epoch=shuffle_each_epoch)
     valid = TextIterator(valid_datasets[0], valid_datasets[1],
-                         dictionaries[:-1], dictionaries[-1],
+                         dictionaries[0], dictionaries[1],
                          n_words_source=n_words_src, n_words_target=n_words,
                          batch_size=valid_batch_size,
                          maxlen=maxlen)
@@ -1310,9 +1348,9 @@ def train(dim_word=100,  # word vector dimensionality
     print 'Building model'
     params = init_params(model_options)
     # reload parameters
-    if reload_ and os.path.exists(saveto):
+    if reload_ and os.path.exists(model_reload_path):
         print 'Reloading model parameters'
-        params = load_params(saveto, params)
+        params = load_params(model_reload_path, params)
 
     tparams = init_tparams(params)
 
@@ -1358,7 +1396,7 @@ def train(dim_word=100,  # word vector dimensionality
 
     # allow finetuning with fixed embeddings
     if finetune:
-        updated_params = OrderedDict([(key,value) for (key,value) in tparams.iteritems() if not key.startswith('Wemb')])
+        updated_params = OrderedDict([(key,value) for (key,value) in tparams.iteritems() if key not in ['Wemb', 'Wemb_dec']])
     else:
         updated_params = tparams
 
@@ -1380,9 +1418,9 @@ def train(dim_word=100,  # word vector dimensionality
 
     # compile the optimizer, the actual computational graph is compiled here
     lr = tensor.scalar(name='lr')
-
-    print 'Building optimizers...',
-    f_grad_shared, f_update = eval(optimizer)(lr, updated_params, grads, inps, cost)
+ 
+    print 'Building optimizers...', ##Ahmed: because of accumulators -- will crash if optimizer =/= adadelta
+    f_grad_shared, f_update, accumulators = eval(optimizer)(lr, updated_params, grads, inps, cost, init_accumulators)
     print 'Done'
 
     print 'Optimization'
@@ -1406,18 +1444,13 @@ def train(dim_word=100,  # word vector dimensionality
     if sampleFreq == -1:
         sampleFreq = len(train[0])/batch_size
 
-    for eidx in xrange(max_epochs):
+    for eidx in xrange(max_epochs): #Restart: eidx
         n_samples = 0
 
         for x, y in train:
             n_samples += len(x)
             uidx += 1
             use_noise.set_value(1.)
-
-            #ensure consistency in number of factors
-            if len(x) and len(x[0]) and len(x[0][0]) != factors:
-                sys.stderr.write('Error: mismatch between number of factors in settings ({0}), and number in training corpus ({1})\n'.format(factors, len(x[0][0])))
-                sys.exit(1)
 
             x, x_mask, y, y_mask = prepare_data(x, y, maxlen=maxlen,
                                                 n_words_src=n_words_src,
@@ -1467,42 +1500,41 @@ def train(dim_word=100,  # word vector dimensionality
                         os.path.splitext(saveto)[0], uidx)
                     numpy.savez(saveto_uidx, history_errs=history_errs,
                                 uidx=uidx, **unzip(tparams))
+                    print 'Saving the accumulators at iteration {}...'.format(uidx),
+                    
+                    with open(saveto_uidx+'accumulators', 'wb') as outfile:
+                        pkl.dump(get_accumlators_values(accumulators), outfile, protocol=pkl.HIGHEST_PROTOCOL)
+
                     print 'Done'
 
 
             # generate some samples with the model and display them
             if numpy.mod(uidx, sampleFreq) == 0:
                 # FIXME: random selection?
-                for jj in xrange(numpy.minimum(5, x.shape[2])):
+                for jj in xrange(numpy.minimum(5, x.shape[1])):
                     stochastic = True
                     sample, score, sample_word_probs, alignment = gen_sample([f_init], [f_next],
-                                               x[:, :, jj][:, :, None],
+                                               x[:, jj][:, None],
                                                trng=trng, k=1,
                                                maxlen=30,
                                                stochastic=stochastic,
                                                argmax=False,
                                                suppress_unk=False)
                     print 'Source ', jj, ': ',
-                    for pos in range(x.shape[1]):
-                        if x[0, pos, jj] == 0:
+                    for vv in x[:, jj]:
+                        if vv == 0:
                             break
-                        for factor in range(factors):
-                            vv = x[factor, pos, jj]
-                            if vv in worddicts_r[factor]:
-                                sys.stdout.write(worddicts_r[factor][vv])
-                            else:
-                                sys.stdout.write('UNK')
-                            if factor+1 < factors:
-                                sys.stdout.write('|')
-                            else:
-                                sys.stdout.write(' ')
+                        if vv in worddicts_r[0]:
+                            print worddicts_r[0][vv],
+                        else:
+                            print 'UNK',
                     print
                     print 'Truth ', jj, ' : ',
                     for vv in y[:, jj]:
                         if vv == 0:
                             break
-                        if vv in worddicts_r[-1]:
-                            print worddicts_r[-1][vv],
+                        if vv in worddicts_r[1]:
+                            print worddicts_r[1][vv],
                         else:
                             print 'UNK',
                     print
@@ -1515,8 +1547,8 @@ def train(dim_word=100,  # word vector dimensionality
                     for vv in ss:
                         if vv == 0:
                             break
-                        if vv in worddicts_r[-1]:
-                            print worddicts_r[-1][vv],
+                        if vv in worddicts_r[1]:
+                            print worddicts_r[1][vv],
                         else:
                             print 'UNK',
                     print
@@ -1569,8 +1601,10 @@ def train(dim_word=100,  # word vector dimensionality
         zipp(best_p, tparams)
 
     use_noise.set_value(0.)
+    
     valid_err, alignment = pred_probs(f_log_probs, prepare_data,
-                           model_options, valid).mean()
+                           model_options, valid)
+    valid_err = valid_err.mean()
 
     print 'Valid ', valid_err
 
