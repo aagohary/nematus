@@ -48,6 +48,15 @@ def itemlist(tparams):
 
 # dropout
 def dropout_layer(state_before, use_noise, trng):
+    """
+    if use_noise:
+      drop half of state_before at random
+    else:
+      downweight all of state_before by 0.5
+    (in expectation, they are the same)
+    input: any Theano variable
+    output: the input variable, dropped out
+    """
     proj = tensor.switch(
         use_noise,
         state_before * trng.binomial(state_before.shape, p=0.5, n=1,
@@ -58,6 +67,11 @@ def dropout_layer(state_before, use_noise, trng):
 
 # dropout that will be re-used at different time steps
 def shared_dropout_layer(shape, use_noise, trng, value):
+    """
+    value is dropout rate
+    output: a variable that can be multiplied by some state to get a dropped out version of that state.
+    i.e., state * shared_dropout_layer(...) <==> dropout_layer(state, ...)
+    """
     proj = tensor.switch(
         use_noise,
         trng.binomial(shape, p=value, n=1,
@@ -94,21 +108,35 @@ layers = {'ff': ('param_init_fflayer', 'fflayer'),
           'gru': ('param_init_gru', 'gru_layer'),
           'gru_cond': ('param_init_gru_cond', 'gru_cond_layer'),
           }
+    # TODO: why is this strings that get eval'd rather than just
+    # function pointers?
 
 
 def get_layer(name):
     fns = layers[name]
+    # see above TODO
     return (eval(fns[0]), eval(fns[1]))
 
 
 # some utilities
 def ortho_weight(ndim):
+    """
+    generate a random ndim*ndim matrix whose columns
+    are orthogonal (and maybe rows too)
+    (eigenvectors of a gaussian random matrix)
+    """
     W = numpy.random.randn(ndim, ndim)
     u, s, v = numpy.linalg.svd(W)
     return u.astype('float32')
 
 
 def norm_weight(nin, nout=None, scale=0.01, ortho=True):
+    """
+    initialize a random weight matrix of size:
+      nin*nout, or nin*nin if nout is not specified
+    if ortho=True and matrix is square, then generate orthogonal matrix
+    otherwise, generate gaussian random matrix with std=scale
+    """
     if nout is None:
         nout = nin
     if nout == nin and ortho:
@@ -174,11 +202,21 @@ def concatenate(tensor_list, axis=0):
 # batch preparation
 def prepare_data(seqs_x, seqs_y, maxlen=None, n_words_src=30000,
                  n_words=30000):
+    """
+    input:
+      seqs_x: list of sentences (a sentence is a list of word ids), input
+      seqs_y: list of sentences (a sentence is a list of word ids), output
+      maxlen: throw out anything where either input or output is >= maxlen
+      
+    output:
+      x, x_mask, y, y_mask which are all LEN*N_SAMPLES matrices
+      x,y are the word ids, and the masks==0. indicates padding
+    """
     # x: a list of sentences
     lengths_x = [len(s) for s in seqs_x]
     lengths_y = [len(s) for s in seqs_y]
 
-    if maxlen is not None:
+    if maxlen is not None:   # throw out sentences that are too long
         new_seqs_x = []
         new_seqs_y = []
         new_lengths_x = []
@@ -198,11 +236,15 @@ def prepare_data(seqs_x, seqs_y, maxlen=None, n_words_src=30000,
             return None, None, None, None
 
     n_samples = len(seqs_x)
-    maxlen_x = numpy.max(lengths_x) + 1
-    maxlen_y = numpy.max(lengths_y) + 1
+    maxlen_x = numpy.max(lengths_x) + 1   # length of longest input + 1
+    maxlen_y = numpy.max(lengths_y) + 1   # length of longest output + 1 <-- presumably +1 is for bigram connections on output layer
 
+    # x, y are matrices of size LEN*N_SAMPLES of word ids
     x = numpy.zeros((maxlen_x, n_samples)).astype('int64')
     y = numpy.zeros((maxlen_y, n_samples)).astype('int64')
+    # x_mask, y_mask are matrices of size LEN*N_SAMPLES == 1. if
+    #   this is an observed word, and == 0. if padding
+    #   padding on the right
     x_mask = numpy.zeros((maxlen_x, n_samples)).astype('float32')
     y_mask = numpy.zeros((maxlen_y, n_samples)).astype('float32')
     for idx, [s_x, s_y] in enumerate(zip(seqs_x, seqs_y)):
@@ -217,6 +259,14 @@ def prepare_data(seqs_x, seqs_y, maxlen=None, n_words_src=30000,
 # feedforward layer: affine transformation + point-wise nonlinearity
 def param_init_fflayer(options, params, prefix='ff', nin=None, nout=None,
                        ortho=True):
+    """
+    initialize parameters for a feed-foward network
+    includes weights W (nin*nout) -- if None, read as dim_proj from options
+    and bias b (1*nout)
+
+    W is initialized by norm_weight, scale=0.01, ortho as argument
+    b is initialized to zero
+    """
     if nin is None:
         nin = options['dim_proj']
     if nout is None:
@@ -229,6 +279,13 @@ def param_init_fflayer(options, params, prefix='ff', nin=None, nout=None,
 
 def fflayer(tparams, state_below, options, prefix='rconv',
             activ='lambda x: tensor.tanh(x)', **kwargs):
+    """
+    computes feed-forward activations
+    state_below = input
+    tparams = theano parameters
+    activ = activation
+    output = result of activ(state_below*W + b)
+    """
     return eval(activ)(
         tensor.dot(state_below, tparams[_p(prefix, 'W')]) +
         tparams[_p(prefix, 'b')])
@@ -236,6 +293,26 @@ def fflayer(tparams, state_below, options, prefix='rconv',
 
 # GRU layer
 def param_init_gru(options, params, prefix='gru', nin=None, dim=None):
+    """
+    initialize parameters for GRU
+    reminder about GRU:
+        input is h_prev and x
+        r     = sigmoid( W[0] x + U[0] h_prev )    <-- reset
+        u     = sigmoid( W[1] x + U[1] h_prev )    <-- gating
+        h_tmp = tanh ( Wx x + r . (Ux h_prev) )
+        h     = u.h_prev + (1-u).h_tmp          (. = component-wise product)
+        everything has bias also
+      so shapes:
+        W[0]: nin x dim
+        W[1]: nin x dim <--- these are packed into one matrix W
+        Wx  : nin x dim
+        U[0]: dim x dim
+        U[1]: dim x dim <--- these are packed into one matrix U
+        Ux  : dim x dim
+    initialization for all biases is zero
+    for square matrices is orthogonal
+    and non-square matrices is gaussian random with default variance
+    """
     if nin is None:
         nin = options['dim_proj']
     if dim is None:
@@ -268,6 +345,17 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
               emb_dropout=None,
               rec_dropout=None,
               **kwargs):
+    """
+    state_below = input to GRU, matrix of size (#words)*(#seqs)*(inp-dim)
+    mask is (#words)*(#seq)
+
+    emb_dropout: 
+    rec_dropout: dropout of hidden state
+    
+    state_below_ = input * W + b
+    state_belowx = input * Wx + bx
+    
+    """
     nsteps = state_below.shape[0]
     if state_below.ndim == 3:
         n_samples = state_below.shape[1]
@@ -280,7 +368,7 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
         mask = tensor.alloc(1., state_below.shape[0], 1)
 
     # utility function to slice a tensor
-    def _slice(_x, n, dim):
+    def _slice(_x, n, dim): 
         if _x.ndim == 3:
             return _x[:, :, n*dim:(n+1)*dim]
         return _x[:, n*dim:(n+1)*dim]
@@ -296,29 +384,39 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
     # step function to be used by scan
     # arguments    | sequences |outputs-info| non-seqs
     def _step_slice(m_, x_, xx_, h_, U, Ux, rec_dropout):
-
-        preact = tensor.dot(h_*rec_dropout[0], U)
-        preact += x_
+        # m_  = mask for this time step
+        # x_  = state_below_ for this time step
+        # xx_ = state_belowx for this time step
+        # h_  = previous hidden state
+        # preact = dropout(h_) * U + x_, called pre-sigmoid "r" in GRU notes
+        preact = tensor.dot(h_*rec_dropout[0], U) + x_
 
         # reset and update gates
-        r = tensor.nnet.sigmoid(_slice(preact, 0, dim))
-        u = tensor.nnet.sigmoid(_slice(preact, 1, dim))
+        r = tensor.nnet.sigmoid(_slice(preact, 0, dim)) # split in half
+        u = tensor.nnet.sigmoid(_slice(preact, 1, dim)) # split in half
 
         # compute the hidden state proposal
-        preactx = tensor.dot(h_*rec_dropout[1], Ux)
-        preactx = preactx * r
-        preactx = preactx + xx_
+        # preactx = (dropout(h_) * Ux) . r + xx_, pre-tanh "h_tmp"
+        preactx = tensor.dot(h_*rec_dropout[1], Ux) * r + xx_
 
-        # hidden state proposal
+        # hidden state proposal, previously called h_tmp
         h = tensor.tanh(preactx)
 
         # leaky integrate and obtain next hidden state
         h = u * h_ + (1. - u) * h
         h = m_[:, None] * h + (1. - m_)[:, None] * h_
+        # if mask==0, then h = h_ (h_prev) <-- during padding, just copy
+        # if mask==1, then h = what we just computed
 
+        # return new hidden state
         return h
 
     # prepare scan arguments
+    # seqs: the sequences that we'll process, TODO figure out what these are
+    # init_state: initial hidden state, which is zero vectors
+    # _step: the function that scan will reduce over
+    # shared_vars: GRU needs U variables because Wx and Wx x will be precomputed
+    # rec_dropout: ???
     seqs = [mask, state_below_, state_belowx]
     init_states = [tensor.alloc(0., n_samples, dim)]
     _step = _step_slice
@@ -326,6 +424,9 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
                    tparams[_p(prefix, 'Ux')],
                    rec_dropout]
 
+    # do reduction over seqs
+    # will return rval=all of the hidden states
+    # and updates is ignored
     rval, updates = theano.scan(_step,
                                 sequences=seqs,
                                 outputs_info=init_states,
@@ -339,9 +440,28 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
 
 
 # Conditional GRU layer with Attention
+# TODO: come back to this later
 def param_init_gru_cond(options, params, prefix='gru_cond',
                         nin=None, dim=None, dimctx=None,
                         nin_nonlin=None, dim_nonlin=None):
+    """
+    initialize parameters for conditional GRU.
+    we run a typical GRU on h_prev and x to get "prime" variables:
+        input is h_prev and x
+        r'     = sigmoid( W[0] x + U[0] h_prev )    <-- reset
+        u'     = sigmoid( W[1] x + U[1] h_prev )    <-- gating
+        h_tmp' = tanh ( Wx x + r' . (Ux h_prev) )
+        h'     = u'.h_prev + (1-u').h_tmp'          (. = component-wise product)
+    then attention-context c is computed as (called "context")
+        e      = U_att * tanh( W_comb_at s' + W_comb_att encodercontext ) ) + c_tt  <-- there is an error in pdf
+        alpha  = softmax( e )
+        ctx_   = E_alpha[ encoder-context ]   # encoder-context is called cc_
+    then a second GRU, with h_prev = h' and x=c
+        r     = sigmoid( Wc[0] ctx_ + U_nl[0] h' )    <-- reset
+        u     = sigmoid( Wc[1] ctx_ + U_nl[1] h' )    <-- gating
+        h_tmp (=_s_j) = tanh( Wx ctx_ + r . (Ux h'))   <-- the same, except c instead of x
+        h = u.h' + (1-u).h_tmp, u is called z in pdf
+    """
     if nin is None:
         nin = options['dim']
     if dim is None:
@@ -410,7 +530,14 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
                    context_mask=None, emb_dropout=None,
                    rec_dropout=None, ctx_dropout=None,
                    **kwargs):
-
+    """
+    input:
+      state_below = x
+      mask as before
+      context = sequence of forward/backward encodings of input
+      rest is the same as gru_layer()
+    """
+    
     assert context, 'Context must be provided'
 
     if one_step:
@@ -435,6 +562,8 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
     # projected context
     assert context.ndim == 3, \
         'Context must be 3-d: #annotation x #sample x dim'
+    # pctx_ = dropout(context) * Wc_att + b_att
+    # this is actually Wa h in the pdf
     pctx_ = tensor.dot(context*ctx_dropout[0], tparams[_p(prefix, 'Wc_att')]) +\
         tparams[_p(prefix, 'b_att')]
 
@@ -444,6 +573,8 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
         return _x[:, n*dim:(n+1)*dim]
 
     # projected x
+    # state_belowx = dropout(x) * Wx + bx
+    # state_below_ = dropout(x) * W  + b
     state_belowx = tensor.dot(state_below*emb_dropout[0], tparams[_p(prefix, 'Wx')]) +\
         tparams[_p(prefix, 'bx')]
     state_below_ = tensor.dot(state_below*emb_dropout[1], tparams[_p(prefix, 'W')]) +\
@@ -452,54 +583,58 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
     def _step_slice(m_, x_, xx_, h_, ctx_, alpha_, pctx_, cc_, rec_dropout, ctx_dropout,
                     U, Wc, W_comb_att, U_att, c_tt, Ux, Wcx,
                     U_nl, Ux_nl, b_nl, bx_nl):
+        # m_ mask, x_=x*W+b, xx_=x*Wx+bx, h_=encoder_context
+        # ctx_=
+        # 
+        
+        preact1 = tensor.nnet.sigmoid( tensor.dot(h_*rec_dropout[0], U) + x_ )
+        r1 = _slice(preact1, 0, dim)  # this is r'
+        u1 = _slice(preact1, 1, dim)  # this is u'
+        preactx1 = tensor.dot(h_*rec_dropout[1], Ux) * r1 + xx_  # this is pre-tanh of h_tmp'
+        h1 = tensor.tanh(preactx1)  # this is h_tmp'
 
-        preact1 = tensor.dot(h_*rec_dropout[0], U)
-        preact1 += x_
-        preact1 = tensor.nnet.sigmoid(preact1)
-
-        r1 = _slice(preact1, 0, dim)
-        u1 = _slice(preact1, 1, dim)
-
-        preactx1 = tensor.dot(h_*rec_dropout[1], Ux)
-        preactx1 *= r1
-        preactx1 += xx_
-
-        h1 = tensor.tanh(preactx1)
-
-        h1 = u1 * h_ + (1. - u1) * h1
+        h1 = u1 * h_ + (1. - u1) * h1  # this is h'
         h1 = m_[:, None] * h1 + (1. - m_)[:, None] * h_
+
+        # at this point, we've run the first GRU to get h',
+        # it's parameters were U and Ux
 
         # attention
         pstate_ = tensor.dot(h1*rec_dropout[2], W_comb_att)
-        pctx__ = pctx_ + pstate_[None, :, :]
-        #pctx__ += xc_
-        pctx__ = tensor.tanh(pctx__)
+        pctx__  = tensor.tanh(pctx_ + pstate_[None, :, :])   # originally +xc_)
         alpha = tensor.dot(pctx__*ctx_dropout[1], U_att)+c_tt
+        # here, alpha should be = e
+        # alpha = Uatt * tanh( [W_comb_att encoder_context] + h' * W_comb_att ) + c_tt
+        #  where [...] = pctx_
+        
+        # alpha = [tanh(pctx_ + {h' * W_comb_att}]*U_att + c_tt
+        # so pctx_ should be U_att s'
+        # there seems to be an error: GRU pdf says W_comb_att*context, but here we have W_comb_att*h'; pdf is wrong, should be Wa*s'_j not Wa*h
         alpha = alpha.reshape([alpha.shape[0], alpha.shape[1]])
+        # softmax the alphas
         alpha = tensor.exp(alpha)
         if context_mask:
             alpha = alpha * context_mask
         alpha = alpha / alpha.sum(0, keepdims=True)
         ctx_ = (cc_ * alpha[:, :, None]).sum(0)  # current context
+        # ctx_ is expectation (under alpha) of encoder_context
 
-        preact2 = tensor.dot(h1*rec_dropout[3], U_nl)+b_nl
-        preact2 += tensor.dot(ctx_*ctx_dropout[2], Wc)
-        preact2 = tensor.nnet.sigmoid(preact2)
+        preact2 = tensor.nnet.sigmoid(tensor.dot(h1*rec_dropout[3], U_nl)+b_nl + \
+                                      tensor.dot(ctx_*ctx_dropout[2], Wc))
+        r2 = _slice(preact2, 0, dim) # this is r
+        u2 = _slice(preact2, 1, dim) # this is u
 
-        r2 = _slice(preact2, 0, dim)
-        u2 = _slice(preact2, 1, dim)
-
-        preactx2 = tensor.dot(h1*rec_dropout[4], Ux_nl)+bx_nl
-        preactx2 *= r2
-        preactx2 += tensor.dot(ctx_*ctx_dropout[3], Wcx)
-
-        h2 = tensor.tanh(preactx2)
+        preactx2 = (tensor.dot(h1*rec_dropout[4], Ux_nl)+bx_nl) * r2 + \
+                   tensor.dot(ctx_*ctx_dropout[3], Wcx)
+        h2 = tensor.tanh(preactx2) # this is h_tmp
 
         h2 = u2 * h1 + (1. - u2) * h2
         h2 = m_[:, None] * h2 + (1. - m_)[:, None] * h1
-
+        # this is h
+        
         return h2, ctx_, alpha.T  # pstate_, preact, preactx, r, u
 
+    # pass pre-multipled x in
     seqs = [mask, state_below_, state_belowx]
     #seqs = [mask, state_below_, state_belowx, state_belowc]
     _step = _step_slice
@@ -540,10 +675,14 @@ def init_params(options):
     params = OrderedDict()
 
     # embedding
+    # Wemb maps input word id -> dim_word embeddings
+    # Wemb_dec maps output word id -> dim_word embeddings
     params['Wemb'] = norm_weight(options['n_words_src'], options['dim_word'])
     params['Wemb_dec'] = norm_weight(options['n_words'], options['dim_word'])
 
     # encoder: bidirectional RNN
+    # build two GRUs, 'encoder' and 'encoder_r' for forward/backward encodings
+    # options['encoder'] is either 'gru' or 'gru_cond'
     params = get_layer(options['encoder'])[0](options, params,
                                               prefix='encoder',
                                               nin=options['dim_word'],
@@ -552,26 +691,40 @@ def init_params(options):
                                               prefix='encoder_r',
                                               nin=options['dim_word'],
                                               dim=options['dim'])
+    # dimension of context is 2dim because we have forward+backward
+    # encodings at each state
     ctxdim = 2 * options['dim']
 
     # init_state, init_cell
+    # connection from (the final states of the input RNNs) -> initial state of the output RNN
+    # call the first part "input representation"
+    # fully connected
     params = get_layer('ff')[0](options, params, prefix='ff_state',
                                 nin=ctxdim, nout=options['dim'])
-    # decoder
+    
+    # decoder, GRU over output embeddings,
+    # every output also gets to look at the "input representation"
     params = get_layer(options['decoder'])[0](options, params,
                                               prefix='decoder',
                                               nin=options['dim_word'],
                                               dim=options['dim'],
                                               dimctx=ctxdim)
     # readout
+    # ff_logit_lstm: initial state of GRU (dim) -> output embedding
+    # ff_logit_prev: output embedding -> output embedding
+    # ff_logit_ctx : attention context -> output embedding
+    # ff_logit     : output embedding -> output vocabulary
     params = get_layer('ff')[0](options, params, prefix='ff_logit_lstm',
-                                nin=options['dim'], nout=options['dim_word'],
+                                nin=options['dim'],
+                                nout=options['dim_word'],
                                 ortho=False)
     params = get_layer('ff')[0](options, params, prefix='ff_logit_prev',
                                 nin=options['dim_word'],
-                                nout=options['dim_word'], ortho=False)
+                                nout=options['dim_word'],
+                                ortho=False)
     params = get_layer('ff')[0](options, params, prefix='ff_logit_ctx',
-                                nin=ctxdim, nout=options['dim_word'],
+                                nin=ctxdim,
+                                nout=options['dim_word'],
                                 ortho=False)
     params = get_layer('ff')[0](options, params, prefix='ff_logit',
                                 nin=options['dim_word'],
@@ -588,6 +741,8 @@ def build_model(tparams, options):
     use_noise = theano.shared(numpy.float32(0.))
 
     # description string: #words x #samples
+    # .tag.test_value is some debugging thing (see http://deeplearning.net/software/theano/tutorial/debug_faq.html)
+    # x, x_mask, y, y_mask: theano variables, see above
     x = tensor.matrix('x', dtype='int64')
     x.tag.test_value = (numpy.random.rand(5, 10)*100).astype('int64')
     x_mask = tensor.matrix('x_mask', dtype='float32')
@@ -601,11 +756,15 @@ def build_model(tparams, options):
     xr = x[::-1]
     xr_mask = x_mask[::-1]
 
+    # timesteps = length of sequence
+    # n_samples = number of sequences
     n_timesteps = x.shape[0]
     n_timesteps_trg = y.shape[0]
     n_samples = x.shape[1]
 
     if options['use_dropout']:
+        # make dropout layers for everything we possibly can
+        # this is intended for training time
         retain_probability_emb = 1-options['dropout_embedding']
         retain_probability_hidden = 1-options['dropout_hidden']
         retain_probability_source = 1-options['dropout_source']
@@ -622,6 +781,8 @@ def build_model(tparams, options):
         source_dropout = tensor.tile(source_dropout, (1,1,options['dim_word']))
         target_dropout = tensor.tile(target_dropout, (1,1,options['dim_word']))
     else:
+        # variables of same size that say don't drop out
+        # this is intended for test time
         rec_dropout = theano.shared(numpy.array([1.]*2, dtype='float32'))
         rec_dropout_r = theano.shared(numpy.array([1.]*2, dtype='float32'))
         rec_dropout_d = theano.shared(numpy.array([1.]*5, dtype='float32'))
@@ -631,24 +792,26 @@ def build_model(tparams, options):
         ctx_dropout_d = theano.shared(numpy.array([1.]*4, dtype='float32'))
 
     # word embedding for forward rnn (source)
+    # take input (x.flatten), map to embeddings (first line), then reshape appropriately
     emb = tparams['Wemb'][x.flatten()]
     emb = emb.reshape([n_timesteps, n_samples, options['dim_word']])
     if options['use_dropout']:
         emb *= source_dropout
 
+    # run forward RNN on input
     proj = get_layer(options['encoder'])[1](tparams, emb, options,
                                             prefix='encoder',
                                             mask=x_mask,
                                             emb_dropout=emb_dropout, 
                                             rec_dropout=rec_dropout)
     
-
     # word embedding for backward rnn (source)
     embr = tparams['Wemb'][xr.flatten()]
     embr = embr.reshape([n_timesteps, n_samples, options['dim_word']])
     if options['use_dropout']:
         embr *= source_dropout[::-1]
 
+    # run backward rnn on input
     projr = get_layer(options['encoder'])[1](tparams, embr, options,
                                              prefix='encoder_r',
                                              mask=xr_mask,
@@ -667,7 +830,7 @@ def build_model(tparams, options):
     if options['use_dropout']:
         ctx_mean *= shared_dropout_layer((n_samples, 2*options['dim']), use_noise, trng, retain_probability_hidden)
 
-    # initial decoder state
+    # initial decoder state, ctx_mean -> feed forward layer, tanh'd
     init_state = get_layer('ff')[1](tparams, ctx_mean, options,
                                     prefix='ff_state', activ='tanh')
 
@@ -677,18 +840,28 @@ def build_model(tparams, options):
     # not condition on the last output.
     emb = tparams['Wemb_dec'][y.flatten()]
     emb = emb.reshape([n_timesteps_trg, n_samples, options['dim_word']])
-
+    # at this point, emb is output embeddings. PERIOD.
+    
     emb_shifted = tensor.zeros_like(emb)
     emb_shifted = tensor.set_subtensor(emb_shifted[1:], emb[:-1])
+    # at this point, emb_shifted = [0 emb[:-1]]
+    # so original emb must be padded on right by something
     emb = emb_shifted
+    # we're now ignoring the original?
+    # TODO: figure out what is going on here.... hypothesis: comments and code are inconsistent
 
     if options['use_dropout']:
         emb *= target_dropout
 
     # decoder - pass through the decoder conditional gru with attention
+    # gru_cond returns:
+    #    hidden states
+    #    attention context vectors
+    #    alpha = argmax of context vectors???
     proj = get_layer(options['decoder'])[1](tparams, emb, options,
                                             prefix='decoder',
-                                            mask=y_mask, context=ctx,
+                                            mask=y_mask,
+                                            context=ctx,
                                             context_mask=x_mask,
                                             one_step=False,
                                             init_state=init_state,
@@ -710,6 +883,12 @@ def build_model(tparams, options):
     opt_ret['dec_alphas'] = proj[2]
 
     # compute word probabilities
+    # probabilities look like:
+    #   probs = softmax( logit )
+    #   logit = linear( dropout[ tanh{ lstm + prev + ctx } ] )
+    #   lstm  = linear( initial state of decoder GRU )
+    #   prev  = linear( embedding of the current word )  <-- TODO: check this
+    #   ctx   = linear( weighted averages of context from attention )
     logit_lstm = get_layer('ff')[1](tparams, proj_h, options,
                                     prefix='ff_logit_lstm', activ='linear')
     logit_prev = get_layer('ff')[1](tparams, emb, options,
@@ -727,20 +906,34 @@ def build_model(tparams, options):
     probs = tensor.nnet.softmax(logit.reshape([logit_shp[0]*logit_shp[1],
                                                logit_shp[2]]))
 
+    
     # cost
     y_flat = y.flatten()
     y_flat_idx = tensor.arange(y_flat.shape[0]) * options['n_words'] + y_flat
     cost = -tensor.log(probs.flatten()[y_flat_idx])
+    # compute negative log likelihood of each true word under
+    # predicted softmax probability distribution
     cost = cost.reshape([y.shape[0], y.shape[1]])
     cost = (cost * y_mask).sum(0)
-
+    # ignore costs of words that were masked out, and add them up
+    
     #print "Print out in build_model()"
     #print opt_ret
     return trng, use_noise, x, x_mask, y, y_mask, opt_ret, cost
 
 
-# build a sampler
 def build_sampler(tparams, options, use_noise, trng, return_alignment=False):
+    """
+    build a sampler, to sample an output at test time
+
+    return pair of Theano functions:
+      f_init: take x (input seq) -> the initial state for the decoder, and context vector
+      f_next: take y (output prefix, context vector, previous decoder state)
+                  -> (probability distribution over words,
+                      sample from that distribution,
+                      next decoder state)
+      (what you need to run the decoder step-by-step)
+    """
     x = tensor.matrix('x', dtype='int64')
     xr = x[::-1]
     n_timesteps = x.shape[0]
@@ -874,11 +1067,21 @@ def build_sampler(tparams, options, use_noise, trng, return_alignment=False):
 
     return f_init, f_next
 
-# generate sample, either with stochastic sampling or beam search. Note that,
-# this function iteratively calls f_init and f_next functions.
 def gen_sample(f_init, f_next, x, trng=None, k=1, maxlen=30,
                stochastic=True, argmax=False, return_alignment=False, suppress_unk=False):
+    """
+    generate an output.
+    some ways of doing this:
+     (1) stochastic=True argmax=False --> sample output sequence GREEDILY by sampling from p(y_t|x)
+     (2) stochastic=True argmax=True  --> generate output sequence GREEDILY by choosing argmax p(y_t|x)
+     (3) stochastic=False             --> beam search with beam-size = k
 
+     ??? if stochastic=False and k=1, is this the same as (1)?
+     
+    generate sample, either with stochastic sampling or beam search. Note that,
+    this function iteratively calls f_init and f_next functions.
+    """               
+    
     # k is the beam size we have
     if k > 1:
         assert not stochastic, \
