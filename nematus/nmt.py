@@ -1067,6 +1067,35 @@ def build_sampler(tparams, options, use_noise, trng, return_alignment=False):
 
     return f_init, f_next
 
+
+def gen_next_word(f_init, f_nexts, x, y, return_alignment=False):
+    """
+    Ahmed
+    returns a distribution (sum if ensemble) over the next word in a given output prefix
+    x: source sentence
+    y: output prefix
+    TODO: return_alignment if needed
+    """        
+    num_models = len(f_init)
+    dec_state = [None]*num_models
+    ctx = [None]*num_models
+    next_p = [None]*num_models
+    
+    # get initial state of decoder and encoder context
+    for i in xrange(num_models):
+        dec_state[i], ctx[i] = f_init[i](x)
+    
+    #??? seems that there is a bug with updating next_w in gen_sample     
+    #updating the decoder state with the given prefix. 
+    for w in [-1]+y: # -1 is a bos indicator
+        w = w * numpy.ones((1,)).astype('int64')
+        for i in xrange(num_models):            
+            inps = [w, ctx[i], dec_state[i]] 
+            next_p[i], next_w_tmp, dec_state[i] = f_next[i](*inps)
+
+    return sum(next_p)[0] 
+
+
 def gen_sample(f_init, f_next, x, trng=None, k=1, maxlen=30,
                stochastic=True, argmax=False, return_alignment=False, suppress_unk=False):
     """
