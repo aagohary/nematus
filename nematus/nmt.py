@@ -913,6 +913,8 @@ def build_model(tparams, options):
     cost = -tensor.log(probs.flatten()[y_flat_idx])
     # compute negative log likelihood of each true word under
     # predicted softmax probability distribution
+    #
+    # this is the cost that's getting fed into sgd etc...
     cost = cost.reshape([y.shape[0], y.shape[1]])
     cost = (cost * y_mask).sum(0)
     # ignore costs of words that were masked out, and add them up
@@ -1101,11 +1103,10 @@ def gen_sample(f_init, f_next, x, trng=None, k=1, maxlen=30,
     """
     generate an output.
     some ways of doing this:
-     (1) stochastic=True argmax=False --> sample output sequence GREEDILY by sampling from p(y_t|x)
-     (2) stochastic=True argmax=True  --> generate output sequence GREEDILY by choosing argmax p(y_t|x)
-     (3) stochastic=False             --> beam search with beam-size = k
-
-     ??? if stochastic=False and k=1, is this the same as (1)?
+      (1) stochastic=True argmax=False --> sample output sequence GREEDILY by sampling from p(y_t|x)
+      (2) stochastic=True argmax=True  --> generate output sequence GREEDILY by choosing argmax p(y_t|x)
+      (3) stochastic=False             --> beam search with beam-size = k
+    [note: if stochastic=False and k=1, is this the same as (2)]
      
     generate sample, either with stochastic sampling or beam search. Note that,
     this function iteratively calls f_init and f_next functions.
@@ -1116,15 +1117,15 @@ def gen_sample(f_init, f_next, x, trng=None, k=1, maxlen=30,
         assert not stochastic, \
             'Beam search does not support stochastic sampling'
 
-    sample = []
-    sample_score = []
-    sample_word_probs = []
+    sample = []                   # sequence of predicted words
+    sample_score = []             # corresponding score(s)
+    sample_word_probs = []        # beam search TODO?
     alignment = []
     if stochastic:
-        sample_score = 0
+        sample_score = 0          # in non-beam search, just one score
 
-    live_k = 1
-    dead_k = 0
+    live_k = 1                    # num of elements on beam
+    dead_k = 0                    # num of completed hypotheses
 
     hyp_samples = [[]] * live_k
     word_probs = [[]] * live_k
@@ -1136,23 +1137,21 @@ def gen_sample(f_init, f_next, x, trng=None, k=1, maxlen=30,
     # for ensemble decoding, we keep track of states and probability distribution
     # for each model in the ensemble
     num_models = len(f_init)
-    next_state = [None]*num_models
-    ctx0 = [None]*num_models
-    next_p = [None]*num_models
-    dec_alphas = [None]*num_models
+    next_state = [None]*num_models   # state of conditional language model (changes over time)
+    ctx0 = [None]*num_models         # context vector from input rnns (constant over time)
+    next_p = [None]*num_models       # distribution over words
+    dec_alphas = [None]*num_models   # alignments
     # get initial state of decoder rnn and encoder context
     for i in xrange(num_models):
-        ret = f_init[i](x)
-        next_state[i] = ret[0]
-        ctx0[i] = ret[1]
+        next_state[i], ctx0[i] = f_init[i](x)       # get initial state and context for each model
     next_w = -1 * numpy.ones((1,)).astype('int64')  # bos indicator
 
-    # x is a sequence of word ids followed by 0, eos id
+    # x is a sequence of word ids followed by 0 (eos id)
     for ii in xrange(maxlen):
         for i in xrange(num_models):
-            ctx = numpy.tile(ctx0[i], [live_k, 1])
-            inps = [next_w, ctx, next_state[i]]
-            ret = f_next[i](*inps)
+            ctx = numpy.tile(ctx0[i], [live_k, 1])  # make live_k copies of context
+            inps = [next_w, ctx, next_state[i]]     # input to LM = word, context and state for each item on beam
+            ret = f_next[i](*inps)                  # let rnn take a step on that input
             # dimension of dec_alpha (k-beam-size, number-of-input-hidden-units)
             next_p[i], next_w_tmp, next_state[i] = ret[0], ret[1], ret[2]
             if return_alignment:
@@ -1160,32 +1159,39 @@ def gen_sample(f_init, f_next, x, trng=None, k=1, maxlen=30,
 
             if suppress_unk:
                 next_p[i][:,1] = -numpy.inf
-        if stochastic:
+        if stochastic:   # aka "not beam search"
             if argmax:
-                nw = sum(next_p)[0].argmax()
+                # [0] below is because there's only one element in the "beam"
+                nw = sum(next_p)[0].argmax()   # next_p is vector of probabilities, sum over models, take argmax -- this is basically a mixture model over the models
             else:
-                nw = next_w_tmp[0]
-            sample.append(nw)
-            sample_score += next_p[0][0, nw]
-            if nw == 0:
+                nw = next_w_tmp[0]             # this is a sample from next_p
+            sample.append(nw)                  # we got a word, append it
+            sample_score += next_p[0][0, nw]   # update score
+            # TODO there's a bug here: we need to update something like:
+            # next_w = nw * numpy.ones((1,)).astype('int64')
+            if nw == 0:                        # eos
                 break
-        else:
-            cand_scores = hyp_scores[:, None] - sum(numpy.log(next_p))
-            probs = sum(next_p)/num_models
-            cand_flat = cand_scores.flatten()
-            probs_flat = probs.flatten()
-            ranks_flat = cand_flat.argpartition(k-dead_k-1)[:(k-dead_k)]
+        else:  # beam search mode
+            # next_p[i,j,k] = p(word k | model i, previous hypothesis j) <-- indices might be slightly wrong
+            probs       = sum(next_p)/num_models     # average word probability over models
+            probs_flat  = probs.flatten()            # p(word k | prev hyp j) avg'd over models i
+
+            cand_scores = hyp_scores[:, None] - sum(numpy.log(next_p))  # [j,k] = path score for hyp k -> word j
+            cand_flat   = cand_scores.flatten()
+            # argpartition is like argsort, but you only care about the top (selection algorithm)
+            ranks_flat  = cand_flat.argpartition(k-dead_k-1)[:(k-dead_k)] # only care about k-dead_k top elements
 
             #averaging the attention weights accross models
             if return_alignment:
                 mean_alignment = sum(dec_alphas)/num_models
 
             voc_size = next_p[0].shape[1]
-            # index of each k-best hypothesis
+            # index of each k-best hypothesis, mapping from flattened version to non-flattened version
             trans_indices = ranks_flat / voc_size
             word_indices = ranks_flat % voc_size
             costs = cand_flat[ranks_flat]
 
+            # now construct subsequence beam state
             new_hyp_samples = []
             new_hyp_scores = numpy.zeros(k-dead_k).astype('float32')
             new_word_probs = []
@@ -1196,11 +1202,13 @@ def gen_sample(f_init, f_next, x, trng=None, k=1, maxlen=30,
                 # at each time step we append the attention weights corresponding to the current target word
                 new_hyp_alignment = [[] for _ in xrange(k-dead_k)]
 
-            # ti -> index of k-best hypothesis
+            # idx is enumeration
+            # ti -> index of k-best hypothesis ... aka which beam element are we extending
+            # wi -> index of word to extend it with
             for idx, [ti, wi] in enumerate(zip(trans_indices, word_indices)):
-                new_hyp_samples.append(hyp_samples[ti]+[wi])
-                new_word_probs.append(word_probs[ti] + [probs_flat[ranks_flat[idx]].tolist()])
-                new_hyp_scores[idx] = copy.copy(costs[idx])
+                new_hyp_samples.append(hyp_samples[ti]+[wi])  # extend ti'th beam with word wi
+                new_word_probs.append(word_probs[ti] + [probs_flat[ranks_flat[idx]].tolist()]) # corresponding probability of this word under each model
+                new_hyp_scores[idx] = copy.copy(costs[idx])   # shallow copy
                 new_hyp_states.append([copy.copy(next_state[i][ti]) for i in xrange(num_models)])
                 if return_alignment:
                     # get history of attention weights for the current hypothesis
@@ -1209,7 +1217,7 @@ def gen_sample(f_init, f_next, x, trng=None, k=1, maxlen=30,
                     new_hyp_alignment[idx].append(mean_alignment[ti])
 
 
-            # check the finished samples
+            # check the finished samples (aka those that have predicted eos=0)
             new_live_k = 0
             hyp_samples = []
             hyp_scores = []
@@ -1219,15 +1227,16 @@ def gen_sample(f_init, f_next, x, trng=None, k=1, maxlen=30,
                 hyp_alignment = []
 
             # sample and sample_score hold the k-best translations and their scores
-            for idx in xrange(len(new_hyp_samples)):
-                if new_hyp_samples[idx][-1] == 0:
-                    sample.append(new_hyp_samples[idx])
+            # why is this logic here and not in the prev loop?
+            for idx in xrange(len(new_hyp_samples)):    # enumerate each of the new beam elements
+                if new_hyp_samples[idx][-1] == 0:       # if it predicted eos
+                    sample.append(new_hyp_samples[idx]) # then this is a final output, incr dead_k
                     sample_score.append(new_hyp_scores[idx])
                     sample_word_probs.append(new_word_probs[idx])
                     if return_alignment:
                         alignment.append(new_hyp_alignment[idx])
                     dead_k += 1
-                else:
+                else:   # predicted a real word
                     new_live_k += 1
                     hyp_samples.append(new_hyp_samples[idx])
                     hyp_scores.append(new_hyp_scores[idx])
@@ -1244,6 +1253,7 @@ def gen_sample(f_init, f_next, x, trng=None, k=1, maxlen=30,
             if dead_k >= k:
                 break
 
+            # get the state for the decoder at the next time step
             next_w = numpy.array([w[-1] for w in hyp_samples])
             next_state = [numpy.array(state) for state in zip(*hyp_states)]
 
@@ -1263,7 +1273,9 @@ def gen_sample(f_init, f_next, x, trng=None, k=1, maxlen=30,
     return sample, sample_score, sample_word_probs, alignment
 
 
-# calculate the log probablities on a given corpus using translation model
+# calculate the log probablities on a given corpus using translation model.
+# essentially map f_log_probs over iterator, producing some json output along the way.
+# used to compute scores on dev data for eg early stopping
 def pred_probs(f_log_probs, prepare_data, options, iterator, verbose=True, normalize=False, alignweights=False):
     probs = []
     n_done = 0
